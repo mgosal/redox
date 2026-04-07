@@ -1,5 +1,13 @@
 [source]
 git = "https://gitlab.redox-os.org/redox-os/contain.git"
+patches = [
+    "redox-ffi-namespace.patch",
+]
 
 [build]
-template = "cargo"
+template = "custom"
+script = """
+cookbook_cargo
+mkdir -pv "${COOKBOOK_STAGE}/etc"
+cp -v "${COOKBOOK_SOURCE}/etc/contain.toml" "${COOKBOOK_STAGE}/etc/contain.toml"
+"""
