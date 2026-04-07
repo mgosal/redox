@@ -20,6 +20,7 @@ use crate::wrap_other_err;
 use pkg::SourceIdentifier;
 use pkg::net_backend::DownloadBackendWriter;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -209,7 +210,19 @@ pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result
                         .arg("--also-filter-submodules");
                 }
                 command.arg(&source_dir_tmp);
-                run_command(command, logger)?;
+                if let Err(e) = run_command(command, logger) {
+                    if !is_redox() {
+                        return Err(e);
+                    }
+                    // TODO: RedoxFS has a race condition problem with `--recursive` and running in multi CPU.
+                    //       It is appear that running the submodule update separately fixes it. Remove this when
+                    //       `git clone https://gitlab.redox-os.org/redox-os/relibc --recursive` proven to work in Redox OS.
+                    let mut cmds = vec!["update", "--init"];
+                    if shallow_clone {
+                        cmds.push("--filter=tree:0");
+                    }
+                    manual_git_recursive_submodule(logger, &source_dir_tmp, cmds)?;
+                }
 
                 // Move source.tmp to source atomically
                 rename(&source_dir_tmp, &source_dir)?;
@@ -238,35 +251,43 @@ pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result
                 run_command(command, logger)?;
 
                 let (head_rev, detached_rev) = get_git_head_rev(&source_dir)?;
-                if detached_rev {
-                    if let Some(rev) = rev
-                        && let Ok(exp_rev) = get_git_tag_rev(&source_dir, &rev)
-                    {
-                        exp_rev == head_rev
-                    } else {
-                        false
-                    }
-                } else {
-                    let (_, remote_branch, remote_name, remote_url) =
-                        get_git_remote_tracking(&source_dir)?;
-                    // TODO: how to get default branch and compare it here?
-                    if let Some(branch) = branch
-                        && branch != &remote_branch
-                    {
-                        false
-                    } else if remote_name != "origin" {
-                        false
-                    } else if &remote_url != chop_dot_git(git) {
-                        false
-                    } else {
-                        match get_git_fetch_rev(&source_dir, &remote_url, &remote_branch) {
-                            Ok(fetch_rev) => fetch_rev == head_rev,
-                            Err(e) => {
-                                log_to_pty!(logger, "{}", e);
+                match (rev, detached_rev) {
+                    (Some(rev), true) => {
+                        if let Ok(exp_rev) = get_git_tag_rev(&source_dir, &rev) {
+                            exp_rev == head_rev
+                        } else {
+                            let mut command = Command::new("git");
+                            command.arg("-C").arg(&source_dir);
+                            command.arg("gc");
+                            run_command(command, logger)?;
+                            if let Ok(exp_rev) = get_git_tag_rev(&source_dir, &rev) {
+                                exp_rev == head_rev
+                            } else {
                                 false
                             }
                         }
                     }
+                    (None, false) => {
+                        let (_, remote_branch, remote_name, remote_url) =
+                            get_git_remote_tracking(&source_dir)?;
+                        // TODO: how to get default branch and compare it here?
+                        if let Some(branch) = branch
+                            && branch != &remote_branch
+                        {
+                            false
+                        } else if remote_name != "origin" || &remote_url != chop_dot_git(git) {
+                            false
+                        } else {
+                            match get_git_fetch_rev(&source_dir, &remote_url, &remote_branch) {
+                                Ok(fetch_rev) => fetch_rev == head_rev,
+                                Err(e) => {
+                                    log_to_pty!(logger, "{}", e);
+                                    false
+                                }
+                            }
+                        }
+                    }
+                    _ => false,
                 }
             };
 
@@ -309,7 +330,12 @@ pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result
                 command.arg("-C").arg(&source_dir);
                 command.arg("submodule").arg("sync").arg("--recursive");
 
-                run_command(command, logger)?;
+                if let Err(e) = run_command(command, logger) {
+                    if !is_redox() {
+                        return Err(e);
+                    }
+                    manual_git_recursive_submodule(logger, &source_dir, vec!["sync"])?;
+                }
 
                 // Update submodules
                 let mut command = Command::new("git");
@@ -322,7 +348,16 @@ pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result
                 if shallow_clone {
                     command.arg("--filter=tree:0");
                 }
-                run_command(command, logger)?;
+                if let Err(e) = run_command(command, logger) {
+                    if !is_redox() {
+                        return Err(e);
+                    }
+                    let mut cmds = vec!["update", "--init"];
+                    if shallow_clone {
+                        cmds.push("--filter=tree:0");
+                    }
+                    manual_git_recursive_submodule(logger, &source_dir, cmds)?;
+                }
 
                 fetch_apply_patches(recipe_dir, patches, script, &source_dir, logger)?;
             }
@@ -426,6 +461,74 @@ pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result
     fetch_apply_source_info(recipe, result.source_ident.to_string())?;
 
     Ok(result)
+}
+
+fn manual_git_recursive_submodule(
+    logger: &PtyOut,
+    source_dir: &PathBuf,
+    cmd: Vec<&str>,
+) -> Result<()> {
+    log_to_pty!(
+        logger,
+        "Git submodule {} failed, might be caused by race condition in RedoxFS, retrying without --recursive.",
+        cmd[0]
+    );
+
+    let mut repo_registry: BTreeMap<PathBuf, bool> = BTreeMap::new();
+
+    loop {
+        let mut dirty_git = false;
+
+        let output = Command::new("find")
+            .args(&[".", "-name", ".git"])
+            .current_dir(&source_dir)
+            .output()
+            .map_err(wrap_io_err!("Failed to execute find"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        for line in stdout.lines() {
+            let git_path = PathBuf::from(line);
+            if let Some(repo_root) = git_path.parent() {
+                let repo_root_buf = repo_root.to_path_buf();
+
+                if !repo_registry.contains_key(&repo_root_buf) {
+                    repo_registry.insert(repo_root_buf.clone(), false);
+                    dirty_git = true;
+                }
+            }
+        }
+
+        if !dirty_git {
+            // completed
+            return Ok(());
+        }
+
+        let pending_repos: Vec<PathBuf> = repo_registry
+            .iter()
+            .filter(|&(_, &synced)| !synced)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        if pending_repos.is_empty() {
+            bail_other_err!("No pending repos but dirty");
+        }
+
+        for repo in pending_repos {
+            println!("==> Processing: {:?}", repo);
+
+            let mut command = Command::new("git");
+            command.arg("-C").arg(&repo).current_dir(&source_dir);
+            command.arg("submodule");
+
+            for cmd in &cmd {
+                command.arg(cmd);
+            }
+            run_command(command, logger)?;
+
+            repo_registry.insert(repo, true);
+        }
+    }
 }
 
 /// This does the same check as in cook_build
