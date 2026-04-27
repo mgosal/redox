@@ -1,5 +1,6 @@
 /build/
 /prefix/
+.DS_Store
 .config
 **/my_*
 # Local settings folder for Jetbrains products (RustRover, IntelliJ, CLion)
